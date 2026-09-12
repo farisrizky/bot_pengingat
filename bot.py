@@ -81,7 +81,9 @@ async def tambah(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         waktu_str, sisa = pesan.split(" ", 1)
         jam, menit = map(int, waktu_str.split(":"))
-        kategori, judul = sisa.split("-", 1)
+        
+        # --- PERUBAHAN DI SINI: Pisahkan berdasarkan KOMA ---
+        kategori, judul = sisa.split(",", 1)
         
         new_id = f"jadwal_{int(datetime.datetime.now().timestamp())}"
         item = {
@@ -100,8 +102,10 @@ async def tambah(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_jobs(context.application, item)
         
         await update.message.reply_text(f"✅ Jadwal '{item['title']}' ditambahkan permanen untuk {waktu_str} WIB.")
-    except Exception:
-        await update.message.reply_text("❌ Format: `/tambah HH:MM Kategori - Judul`", parse_mode="Markdown")
+    except Exception as e:
+        print(f"Error parsing command: {e}")
+        # --- PERUBAHAN PESAN ERROR ---
+        await update.message.reply_text("❌ Format: `/tambah HH:MM Kategori, Judul`", parse_mode="Markdown")
 
 # --- SERVER PALSU UNTUK MENGAKALI RENDER ---
 class DummyHandler(BaseHTTPRequestHandler):
@@ -111,7 +115,7 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
     def log_message(self, format, *args):
-        pass # Biar log server gak nyampah kepanjangan
+        pass
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
@@ -130,14 +134,11 @@ def main():
         STATUS_JADWAL[item['id']] = True
         schedule_jobs(app, item)
 
-    # 1. Nyalakan web server palsu di background
     threading.Thread(target=run_dummy_server, daemon=True).start()
 
-    # 2. Fix error event loop dari Python 3.14
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # 3. Jalankan bot telegram
     app.run_polling()
 
 if __name__ == '__main__':
