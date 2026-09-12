@@ -41,14 +41,13 @@ async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ada_yang_diselesaikan = False
         
         for jid, item in semua_jadwal.items():
-            t_remind = datetime.time(item["hour"], item["minute"], 0, tzinfo=TZ)
+            # PERBAIKAN 1: Hapus tzinfo=TZ agar bisa dibandingkan dengan now.time()
+            t_remind = datetime.time(item["hour"], item["minute"], 0) 
             
-            # Cek jika jadwal sudah lewat waktunya DAN belum diselesaikan hari ini
             if now.time() >= t_remind and item.get("last_completed") != today_str:
-                item["last_completed"] = today_str  # Stempel tanggal persisten ke database
+                item["last_completed"] = today_str  
                 ada_yang_diselesaikan = True
                 
-                # Matikan alarm cerewet (nagging) untuk jadwal ini
                 for job in context.application.job_queue.get_jobs_by_name(f"nag_{jid}"):
                     job.schedule_removal()
                     
@@ -96,6 +95,7 @@ async def trigger_reminder(context: ContextTypes.DEFAULT_TYPE):
     )
 
 def schedule_jobs(app, item):
+    # Mesin alarm APScheduler tetap wajib pakai tzinfo=TZ
     t_remind = datetime.time(item["hour"], item["minute"], 0, tzinfo=TZ)
     for job in app.job_queue.get_jobs_by_name(f"remind_{item['id']}"):
         job.schedule_removal()
@@ -115,7 +115,7 @@ async def tambah(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "title": judul.strip(),
             "hour": jam,
             "minute": menit,
-            "last_completed": "" # Field baru untuk tracking harian
+            "last_completed": "" 
         }
         
         semua_jadwal = load_jadwal_firebase()
@@ -169,7 +169,9 @@ async def list_jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pesan = "📋 **STATUS PENGINGAT HARI INI:**\n\n"
     for idx, item in enumerate(jadwal_urut, 1):
         jam_str = f"{item['hour']:02d}:{item['minute']:02d}"
-        t_remind = datetime.time(item["hour"], item["minute"], 0, tzinfo=TZ)
+        
+        # PERBAIKAN 2: Hapus tzinfo=TZ di sini juga
+        t_remind = datetime.time(item["hour"], item["minute"], 0)
         
         if item.get("last_completed") == today_str:
             status_teks = "✅ Sudah Selesai"
