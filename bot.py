@@ -2,6 +2,7 @@ import os
 import datetime
 import requests
 import threading
+import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -13,13 +14,23 @@ TZ = datetime.timezone(datetime.timedelta(hours=7))
 STATUS_JADWAL = {}
 
 def load_jadwal_firebase():
-    response = requests.get(f"{FIREBASE_URL}jadwal.json")
-    if response.status_code == 200 and response.json():
-        return response.json()
+    if not FIREBASE_URL:
+        return {}
+    try:
+        response = requests.get(f"{FIREBASE_URL}jadwal.json")
+        if response.status_code == 200 and response.json():
+            return response.json()
+    except Exception:
+        pass
     return {}
 
 def save_jadwal_firebase(jadwal_dict):
-    requests.put(f"{FIREBASE_URL}jadwal.json", json=jadwal_dict)
+    if not FIREBASE_URL:
+        return
+    try:
+        requests.put(f"{FIREBASE_URL}jadwal.json", json=jadwal_dict)
+    except Exception:
+        pass
 
 async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower().strip()
@@ -99,6 +110,8 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.send_header('Content-type','text/plain')
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
+    def log_message(self, format, *args):
+        pass # Biar log server gak nyampah kepanjangan
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
@@ -117,9 +130,14 @@ def main():
         STATUS_JADWAL[item['id']] = True
         schedule_jobs(app, item)
 
-    # Menyalakan server palsu secara bersamaan
+    # 1. Nyalakan web server palsu di background
     threading.Thread(target=run_dummy_server, daemon=True).start()
 
+    # 2. Fix error event loop dari Python 3.14
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # 3. Jalankan bot telegram
     app.run_polling()
 
 if __name__ == '__main__':
