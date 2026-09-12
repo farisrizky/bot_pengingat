@@ -11,7 +11,6 @@ TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 FIREBASE_URL = os.environ.get("FIREBASE_URL")
 TZ = datetime.timezone(datetime.timedelta(hours=7))
-STATUS_JADWAL = {}
 
 def load_jadwal_firebase():
     if not FIREBASE_URL:
@@ -35,32 +34,49 @@ def save_jadwal_firebase(jadwal_dict):
 async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower().strip()
     if text in ["done", "sudah", "ok", "siap", "selesai"]:
-        pending = [jid for jid, st in STATUS_JADWAL.items() if not st]
-        if pending:
-            for jid in pending:
-                STATUS_JADWAL[jid] = True
-                # Matikan alarm cerewet (nagging) berulang untuk jadwal ini
+        semua_jadwal = load_jadwal_firebase()
+        now = datetime.datetime.now(TZ)
+        today_str = now.date().isoformat()
+        
+        ada_yang_diselesaikan = False
+        
+        for jid, item in semua_jadwal.items():
+            t_remind = datetime.time(item["hour"], item["minute"], 0, tzinfo=TZ)
+            
+            # Cek jika jadwal sudah lewat waktunya DAN belum diselesaikan hari ini
+            if now.time() >= t_remind and item.get("last_completed") != today_str:
+                item["last_completed"] = today_str  # Stempel tanggal persisten ke database
+                ada_yang_diselesaikan = True
+                
+                # Matikan alarm cerewet (nagging) untuk jadwal ini
                 for job in context.application.job_queue.get_jobs_by_name(f"nag_{jid}"):
                     job.schedule_removal()
                     
+        if ada_yang_diselesaikan:
+            save_jadwal_firebase(semua_jadwal)
             await context.bot.send_message(
                 chat_id=update.effective_chat.id, 
-                text="✅ Terima kasih! Pengingat aktif telah ditandai selesai."
+                text="✅ Terima kasih! Semua pengingat yang tertunda telah ditandai selesai untuk hari ini."
             )
 
 async def trigger_nag(context: ContextTypes.DEFAULT_TYPE):
     item = context.job.data
-    if not STATUS_JADWAL.get(item['id'], True):
+    semua_jadwal = load_jadwal_firebase()
+    db_item = semua_jadwal.get(item['id'])
+    
+    today_str = datetime.date.today().isoformat()
+    
+    if db_item and db_item.get("last_completed") != today_str:
         msg = (
-            f"⚠️ **PERHATIAN [{item['category'].upper()}]**\n"
-            f"Jadwal **{item['title']}** belum ditandai selesai! (Peringatan diulang setiap 15 menit)"
+            f"⚠️ **PERHATIAN [{db_item['category'].upper()}]**\n"
+            f"Jadwal **{db_item['title']}** belum ditandai selesai! (Peringatan diulang setiap 15 menit)"
         )
         await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+    else:
+        context.job.schedule_removal()
 
 async def trigger_reminder(context: ContextTypes.DEFAULT_TYPE):
     item = context.job.data
-    STATUS_JADWAL[item['id']] = False
-    
     msg = (
         f"⏰ **PENGINGAT [{item['category'].upper()}]**\n"
         f"Waktunya untuk: **{item['title']}**.\n\n"
@@ -68,11 +84,9 @@ async def trigger_reminder(context: ContextTypes.DEFAULT_TYPE):
     )
     await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
     
-    # Menghapus job nagging lama jika kebetulan masih nyangkut
     for job in context.job_queue.get_jobs_by_name(f"nag_{item['id']}"):
         job.schedule_removal()
         
-    # Memulai alarm cerewet yang akan berulang setiap 15 menit (900 detik)
     context.job_queue.run_repeating(
         trigger_nag, 
         interval=900, 
@@ -83,12 +97,8 @@ async def trigger_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 def schedule_jobs(app, item):
     t_remind = datetime.time(item["hour"], item["minute"], 0, tzinfo=TZ)
-    
-    # Hapus jadwal pengingat utama yang lama
     for job in app.job_queue.get_jobs_by_name(f"remind_{item['id']}"):
         job.schedule_removal()
-    
-    # Set jadwal harian hanya untuk pengingat utamanya saja
     app.job_queue.run_daily(trigger_reminder, time=t_remind, data=item, name=f"remind_{item['id']}")
 
 async def tambah(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -104,16 +114,15 @@ async def tambah(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "category": kategori.strip(),
             "title": judul.strip(),
             "hour": jam,
-            "minute": menit
+            "minute": menit,
+            "last_completed": "" # Field baru untuk tracking harian
         }
         
         semua_jadwal = load_jadwal_firebase()
         semua_jadwal[new_id] = item
         save_jadwal_firebase(semua_jadwal)
         
-        STATUS_JADWAL[new_id] = True
         schedule_jobs(context.application, item)
-        
         await update.message.reply_text(f"✅ Jadwal '{item['title']}' ditambahkan permanen untuk {waktu_str} WIB.")
     except Exception as e:
         print(f"Error parsing command: {e}")
@@ -136,13 +145,9 @@ async def hapus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if id_to_delete:
         del semua_jadwal[id_to_delete]
         save_jadwal_firebase(semua_jadwal)
-        
-        if id_to_delete in STATUS_JADWAL:
-            del STATUS_JADWAL[id_to_delete]
             
         current_jobs_remind = context.application.job_queue.get_jobs_by_name(f"remind_{id_to_delete}")
         current_jobs_nag = context.application.job_queue.get_jobs_by_name(f"nag_{id_to_delete}")
-        
         for job in current_jobs_remind + current_jobs_nag:
             job.schedule_removal()
             
@@ -158,16 +163,20 @@ async def list_jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     jadwal_urut = sorted(semua_jadwal.values(), key=lambda x: (x['hour'], x['minute']))
+    now = datetime.datetime.now(TZ)
+    today_str = now.date().isoformat()
     
     pesan = "📋 **STATUS PENGINGAT HARI INI:**\n\n"
     for idx, item in enumerate(jadwal_urut, 1):
         jam_str = f"{item['hour']:02d}:{item['minute']:02d}"
+        t_remind = datetime.time(item["hour"], item["minute"], 0, tzinfo=TZ)
         
-        # Mengecek status tugas saat ini
-        if STATUS_JADWAL.get(item['id'], True):
-            status_teks = "✅ Aman / Sudah Selesai"
-        else:
+        if item.get("last_completed") == today_str:
+            status_teks = "✅ Sudah Selesai"
+        elif now.time() >= t_remind:
             status_teks = "⏳ Tertunda (Menunggu Konfirmasi)"
+        else:
+            status_teks = "💤 Belum Waktunya"
             
         pesan += f"{idx}. **{jam_str} WIB** | {item['category']} - {item['title']}\n   Status: {status_teks}\n\n"
     
@@ -199,7 +208,6 @@ def main():
 
     semua_jadwal = load_jadwal_firebase()
     for jid, item in semua_jadwal.items():
-        STATUS_JADWAL[item['id']] = True
         schedule_jobs(app, item)
 
     threading.Thread(target=run_dummy_server, daemon=True).start()
