@@ -24,7 +24,6 @@ def load_jadwal_firebase():
     if not url:
         return {}
     try:
-        # Added timeout to prevent Render server freezes
         response = requests.get(url, timeout=10)
         if response.status_code == 200 and response.json():
             return response.json()
@@ -45,7 +44,6 @@ async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower().strip()
     trigger_words = ["done", "sudah", "ok", "siap", "selesai"]
     
-    # Check if the message starts with a trigger word
     used_trigger = None
     for word in trigger_words:
         if text == word or text.startswith(word + " "):
@@ -59,7 +57,6 @@ async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.datetime.now(TZ)
     today_str = now.date().isoformat()
     
-    # Find all PENDING schedules (time has passed, but not marked done today)
     pending_schedules = []
     for jid, item in semua_jadwal.items():
         try:
@@ -67,7 +64,7 @@ async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if now.time() >= t_remind and item.get("last_completed") != today_str:
                 pending_schedules.append((jid, item))
         except ValueError:
-            continue # Skip corrupted data
+            continue
             
     if not pending_schedules:
         return 
@@ -75,41 +72,37 @@ async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_jid = None
     target_item = None
     
-    # Extract specific keywords from the user (e.g., "done obat" -> keyword = "obat")
     keyword = text[len(used_trigger):].strip()
     
     if keyword:
-        # User specified a schedule
         for jid, item in pending_schedules:
-            if keyword in item['title'].lower() or keyword in item['category'].lower():
+            title_lower = item['title'].lower().strip()
+            
+            if keyword == title_lower or keyword in title_lower:
                 target_jid = jid
                 target_item = item
                 break
                 
         if not target_jid:
-            await update.message.reply_text(f"❌ Tidak ada pengingat tertunda yang mengandung kata '{keyword}'.")
+            await update.message.reply_text(f"❌ Tidak ada pengingat tertunda yang cocok dengan '{keyword}'.")
             return
     else:
-        # User only typed "done"
         if len(pending_schedules) == 1:
             target_jid, target_item = pending_schedules[0]
         else:
-            # If >1 pending, ask user to be specific
             msg = "⚠️ **Ada beberapa pengingat yang tertunda:**\n"
             for i, (jid, item) in enumerate(pending_schedules, 1):
-                msg += f"{i}. {item['title']} [{item['category']}]\n"
+                msg += f"{i}. {item['title']}\n"
             
-            contoh = pending_schedules[0][1]['title'].split()[0]
-            msg += f"\nTolong sebutkan spesifik. Contoh: `{used_trigger} {contoh}`"
+            contoh = pending_schedules[0][1]['title'].lower()
+            msg += f"\nTolong sebutkan nama spesifik. Contoh: `{used_trigger} {contoh}`"
             await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="Markdown")
             return
 
-    # Mark as completed
     if target_jid and target_item:
         target_item["last_completed"] = today_str  
         save_jadwal_firebase(semua_jadwal)
         
-        # Remove nagging ONLY for the completed schedule
         for job in context.application.job_queue.get_jobs_by_name(f"nag_{target_jid}"):
             job.schedule_removal()
             
@@ -128,7 +121,7 @@ async def trigger_nag(context: ContextTypes.DEFAULT_TYPE):
     
     if db_item and db_item.get("last_completed") != today_str:
         msg = (
-            f"⚠️ **PERHATIAN [{db_item['category'].upper()}]**\n"
+            f"⚠️ **PERHATIAN**\n"
             f"Jadwal **{db_item['title']}** belum ditandai selesai! (Peringatan diulang setiap 15 menit)"
         )
         await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
@@ -138,9 +131,9 @@ async def trigger_nag(context: ContextTypes.DEFAULT_TYPE):
 async def trigger_reminder(context: ContextTypes.DEFAULT_TYPE):
     item = context.job.data
     msg = (
-        f"⏰ **PENGINGAT [{item['category'].upper()}]**\n"
+        f"⏰ **PENGINGAT**\n"
         f"Waktunya untuk: **{item['title']}**.\n\n"
-        f"Ketik **'sudah {item['title'].split()[0]}'** jika sudah dilakukan."
+        f"Ketik **'sudah {item['title'].lower()}'** jika sudah dilakukan."
     )
     await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
     
@@ -156,7 +149,6 @@ async def trigger_reminder(context: ContextTypes.DEFAULT_TYPE):
     )
 
 def schedule_jobs(app, item):
-    # Crash-proof wrapper: ignore schedules with invalid time formatting
     try:
         t_remind = datetime.time(item["hour"], item["minute"], 0, tzinfo=TZ)
         for job in app.job_queue.get_jobs_by_name(f"remind_{item['id']}"):
@@ -168,21 +160,20 @@ def schedule_jobs(app, item):
 async def tambah(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pesan = " ".join(context.args)
     try:
-        waktu_str, sisa = pesan.split(" ", 1)
+        waktu_str, judul_full = pesan.split(" ", 1)
         jam, menit = map(int, waktu_str.split(":"))
         
-        # Validation to prevent users from adding corrupt times
         if not (0 <= jam <= 23) or not (0 <= menit <= 59):
             await update.message.reply_text("❌ Format waktu salah! Jam harus 00-23 dan menit 00-59.")
             return
             
-        kategori, judul = sisa.split(",", 1)
+        judul = judul_full.strip()
         
         new_id = f"jadwal_{int(datetime.datetime.now().timestamp())}"
         item = {
             "id": new_id,
-            "category": kategori.strip(),
-            "title": judul.strip(),
+            "category": "", # Kept for backwards database compatibility but no longer displayed
+            "title": judul,
             "hour": jam,
             "minute": menit,
             "last_completed": "" 
@@ -196,7 +187,7 @@ async def tambah(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Jadwal '{item['title']}' ditambahkan permanen untuk {waktu_str} WIB.")
     except Exception as e:
         print(f"Error parsing command: {e}")
-        await update.message.reply_text("❌ Format: `/tambah HH:MM Kategori, Judul`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Format: `/tambah HH:MM Judul Pengingat`\nContoh: `/tambah 08:00 Minum Obat MST`", parse_mode="Markdown")
 
 async def hapus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pesan = " ".join(context.args).strip()
@@ -245,11 +236,11 @@ async def list_jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if item.get("last_completed") == today_str:
                 status_teks = "✅ Sudah Selesai"
             elif now.time() >= t_remind:
-                status_teks = "⏳ Tertunda (Ketik: `done " + item['title'].split()[0] + "`)"
+                status_teks = "⏳ Tertunda (Ketik: `done " + item['title'].lower() + "`)"
             else:
                 status_teks = "💤 Belum Waktunya"
                 
-            pesan += f"{idx}. **{jam_str} WIB** | {item['category']} - {item['title']}\n   Status: {status_teks}\n\n"
+            pesan += f"{idx}. **{jam_str} WIB** | {item['title']}\n   Status: {status_teks}\n\n"
         except (ValueError, KeyError):
             pesan += f"{idx}. ⚠️ Data Rusak - Hapus dan buat ulang dari Firebase\n\n"
     
