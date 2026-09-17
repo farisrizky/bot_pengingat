@@ -12,58 +12,116 @@ CHAT_ID = os.environ.get("CHAT_ID")
 FIREBASE_URL = os.environ.get("FIREBASE_URL")
 TZ = datetime.timezone(datetime.timedelta(hours=7))
 
-def load_jadwal_firebase():
+# Helper untuk memastikan URL Firebase valid meskipun lupa menaruh slash (/) di akhir
+def get_fb_url(endpoint="jadwal.json"):
     if not FIREBASE_URL:
+        return ""
+    base = FIREBASE_URL if FIREBASE_URL.endswith("/") else f"{FIREBASE_URL}/"
+    return base + endpoint
+
+def load_jadwal_firebase():
+    url = get_fb_url()
+    if not url:
         return {}
     try:
-        response = requests.get(f"{FIREBASE_URL}jadwal.json")
+        # Tambahkan timeout agar bot tidak freeze/hang di server Render
+        response = requests.get(url, timeout=10)
         if response.status_code == 200 and response.json():
             return response.json()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error loading Firebase: {e}")
     return {}
 
 def save_jadwal_firebase(jadwal_dict):
-    if not FIREBASE_URL:
+    url = get_fb_url()
+    if not url:
         return
     try:
-        requests.put(f"{FIREBASE_URL}jadwal.json", json=jadwal_dict)
-    except Exception:
-        pass
+        requests.put(url, json=jadwal_dict, timeout=10)
+    except Exception as e:
+        print(f"Error saving Firebase: {e}")
 
 async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower().strip()
-    if text in ["done", "sudah", "ok", "siap", "selesai"]:
-        semua_jadwal = load_jadwal_firebase()
-        now = datetime.datetime.now(TZ)
-        today_str = now.date().isoformat()
-        
-        ada_yang_diselesaikan = False
-        
-        for jid, item in semua_jadwal.items():
-            # PERBAIKAN 1: Hapus tzinfo=TZ agar bisa dibandingkan dengan now.time()
-            t_remind = datetime.time(item["hour"], item["minute"], 0) 
+    trigger_words = ["done", "sudah", "ok", "siap", "selesai"]
+    
+    # Cek apakah pesan dimulai dengan trigger word
+    used_trigger = None
+    for word in trigger_words:
+        if text == word or text.startswith(word + " "):
+            used_trigger = word
+            break
             
-            if now.time() >= t_remind and item.get("last_completed") != today_str:
-                item["last_completed"] = today_str  
-                ada_yang_diselesaikan = True
+    if not used_trigger:
+        return
+
+    semua_jadwal = load_jadwal_firebase()
+    now = datetime.datetime.now(TZ)
+    today_str = now.date().isoformat()
+    
+    # Cari semua jadwal yang berstatus TERTUNDA (sudah lewat waktunya tapi belum di-done)
+    pending_schedules = []
+    for jid, item in semua_jadwal.items():
+        t_remind = datetime.time(item["hour"], item["minute"], 0) 
+        if now.time() >= t_remind and item.get("last_completed") != today_str:
+            pending_schedules.append((jid, item))
+            
+    if not pending_schedules:
+        return # Jika tidak ada yang tertunda, abaikan saja
+        
+    target_jid = None
+    target_item = None
+    
+    # Ambil spesifikasi dari user (misal "done obat" -> keyword = "obat")
+    keyword = text[len(used_trigger):].strip()
+    
+    if keyword:
+        # User menyebutkan spesifik jadwalnya
+        for jid, item in pending_schedules:
+            if keyword in item['title'].lower() or keyword in item['category'].lower():
+                target_jid = jid
+                target_item = item
+                break
                 
-                for job in context.application.job_queue.get_jobs_by_name(f"nag_{jid}"):
-                    job.schedule_removal()
-                    
-        if ada_yang_diselesaikan:
-            save_jadwal_firebase(semua_jadwal)
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id, 
-                text="✅ Terima kasih! Semua pengingat yang tertunda telah ditandai selesai untuk hari ini."
-            )
+        if not target_jid:
+            await update.message.reply_text(f"❌ Tidak ada pengingat tertunda yang mengandung kata '{keyword}'.")
+            return
+    else:
+        # User hanya mengetik "done"
+        if len(pending_schedules) == 1:
+            target_jid, target_item = pending_schedules[0]
+        else:
+            # Jika ada >1 yang tertunda, minta user untuk spesifik
+            msg = "⚠️ **Ada beberapa pengingat yang tertunda:**\n"
+            for i, (jid, item) in enumerate(pending_schedules, 1):
+                msg += f"{i}. {item['title']} [{item['category']}]\n"
+            
+            contoh = pending_schedules[0][1]['title'].split()[0] # Ambil kata pertama dari jadwal pertama
+            msg += f"\nTolong sebutkan spesifik. Contoh: `{used_trigger} {contoh}`"
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="Markdown")
+            return
+
+    # Menandai Selesai untuk Jadwal yang terpilih
+    if target_jid and target_item:
+        target_item["last_completed"] = today_str  
+        save_jadwal_firebase(semua_jadwal)
+        
+        # Hapus alarm nag HANYA untuk jadwal yang di-done
+        for job in context.application.job_queue.get_jobs_by_name(f"nag_{target_jid}"):
+            job.schedule_removal()
+            
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id, 
+            text=f"✅ Terima kasih! Pengingat **'{target_item['title']}'** telah ditandai selesai untuk hari ini.",
+            parse_mode="Markdown"
+        )
 
 async def trigger_nag(context: ContextTypes.DEFAULT_TYPE):
     item = context.job.data
     semua_jadwal = load_jadwal_firebase()
     db_item = semua_jadwal.get(item['id'])
     
-    today_str = datetime.date.today().isoformat()
+    today_str = datetime.datetime.now(TZ).date().isoformat()
     
     if db_item and db_item.get("last_completed") != today_str:
         msg = (
@@ -79,7 +137,7 @@ async def trigger_reminder(context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"⏰ **PENGINGAT [{item['category'].upper()}]**\n"
         f"Waktunya untuk: **{item['title']}**.\n\n"
-        f"Ketik **'sudah'** atau **'done'** jika sudah dilakukan."
+        f"Ketik **'sudah {item['title'].split()[0]}'** jika sudah dilakukan."
     )
     await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
     
@@ -95,7 +153,6 @@ async def trigger_reminder(context: ContextTypes.DEFAULT_TYPE):
     )
 
 def schedule_jobs(app, item):
-    # Mesin alarm APScheduler tetap wajib pakai tzinfo=TZ
     t_remind = datetime.time(item["hour"], item["minute"], 0, tzinfo=TZ)
     for job in app.job_queue.get_jobs_by_name(f"remind_{item['id']}"):
         job.schedule_removal()
@@ -170,13 +227,12 @@ async def list_jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for idx, item in enumerate(jadwal_urut, 1):
         jam_str = f"{item['hour']:02d}:{item['minute']:02d}"
         
-        # PERBAIKAN 2: Hapus tzinfo=TZ di sini juga
         t_remind = datetime.time(item["hour"], item["minute"], 0)
         
         if item.get("last_completed") == today_str:
             status_teks = "✅ Sudah Selesai"
         elif now.time() >= t_remind:
-            status_teks = "⏳ Tertunda (Menunggu Konfirmasi)"
+            status_teks = "⏳ Tertunda (Ketik: `done " + item['title'].split()[0] + "`)"
         else:
             status_teks = "💤 Belum Waktunya"
             
